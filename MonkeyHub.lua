@@ -57,7 +57,7 @@ local CONFIG = {
 	UI_LIBRARY_FILE = "ui.lua",
 	SETTINGS_FILE = "MonkeyHub/settings/config.json",
 	INTRO_STAMP_FILE = "MonkeyHub/settings/intro.stamp",
-	INTRO_COOLDOWN = 900,
+	INTRO_COOLDOWN = 180,
 	REEXEC_SOURCE = 'loadstring(game:HttpGet("https://raw.githubusercontent.com/primelyn123-jpg/monkey-hub/main/MonkeyHub.lua"))()',
 	READY_TIMEOUT = 90,
 	TICK_RATE = 0.08,
@@ -98,6 +98,8 @@ local Game = {}
 local Library, Toggles, Options = nil, nil, nil
 local Net = { last = {}, counts = {}, total = 0 }
 local state = {
+	buffs = false,
+	originalFireRate = false,
 	zones = {},
 	skillLast = {},
 	bossEvents = {},
@@ -238,6 +240,44 @@ end
 local function enabled(name)
 	local toggle = Toggles and Toggles[name]
 	return toggle ~= nil and toggle.Value == true
+end
+
+-- Fire-rate multiplier from the Rapid fire toggle (1 when off).
+---@return number
+local function rapidMultiplier()
+	if not enabled("RapidFire") then
+		return 1
+	end
+	return math.max(1, tonumber(Options and Options.RapidFireMult and Options.RapidFireMult.Value) or 1)
+end
+
+-- Wraps GunKit Buffs.fireRate so the game's own firing loop runs faster. The server may still cap cadence.
+local function hookRapidFire()
+	if state.originalFireRate then
+		return
+	end
+	local ok, buffs = pcall(function()
+		return safeRequire(waitPath(replicatedStorage, "GunKit.Shared.Buffs"))
+	end)
+	if not ok or type(buffs) ~= "table" or type(buffs.fireRate) ~= "function" then
+		warn("[MonkeyHub] Buffs.fireRate not found; rapid fire unavailable")
+		return
+	end
+	local original = buffs.fireRate
+	pcall(function()
+		if setreadonly then
+			setreadonly(buffs, false)
+		end
+	end)
+	local installed = pcall(function()
+		buffs.fireRate = function(...)
+			return original(...) * rapidMultiplier()
+		end
+	end)
+	if installed then
+		state.originalFireRate = original
+		state.buffs = buffs
+	end
 end
 
 ---@return Model?, Humanoid?, BasePart?
@@ -1211,8 +1251,9 @@ local function combat(humanoid, character, root, now)
 		return
 	end
 	Game.gun:PushAim()
-	local interval = 60 / (projectile.roundsPerMinute or 60)
-	if now - state.lastFire >= math.max(CONFIG.MIN_FIRE_GAP, interval) then
+	local multiplier = rapidMultiplier()
+	local interval = 60 / (projectile.roundsPerMinute or 60) / multiplier
+	if now - state.lastFire >= math.max(CONFIG.MIN_FIRE_GAP / multiplier, interval) then
 		tool:Activate()
 		state.lastFire = now
 		state.shots = (state.shots or 0) + 1
@@ -1240,6 +1281,9 @@ local function replay(humanoid)
 		local queue = queue_on_teleport or getgenv().queueonteleport
 		if queue then
 			queue(CONFIG.REEXEC_SOURCE)
+			if writefile then
+				pcall(writefile, CONFIG.INTRO_STAMP_FILE, tostring(os.time()))
+			end
 			state.teleportQueued = true
 		end
 	end
@@ -1490,9 +1534,6 @@ local function buildUi()
 	local ui = loadUiLibrary()
 	local saved = readSettings()
 	local introWanted = shouldPlayIntro()
-	if introWanted and writefile then
-		pcall(writefile, CONFIG.INTRO_STAMP_FILE, tostring(os.time()))
-	end
 
 	Toggles, Options = {}, {}
 	local window = ui:CreateWindow({
@@ -1563,6 +1604,7 @@ local function buildUi()
 			Text = cfg.Text,
 			Min = cfg.Min,
 			Max = cfg.Max,
+			Increment = cfg.Increment,
 			Default = cfg.Default,
 			Callback = function(value)
 				entry.Value, entry.Raw = value, value
@@ -1597,55 +1639,78 @@ local function buildUi()
 		end
 	end
 
-	local mainTab = window:CreateTab("Main")
-	mainTab:AddSection("Combat")
-	addToggle(mainTab, "AutoFight", { Text = "Auto fight", Default = false })
-	addToggle(mainTab, "AimAssist", { Text = "Aim assist (manual fire)", Default = false })
-	addDropdown(mainTab, "AimMode", { Text = "Aim mode", Values = { "Game assist", "Override (risky)" }, Default = 1 })
-	addSlider(mainTab, "AssistCone", { Text = "Assist cone (deg)", Default = 180, Min = 20, Max = 180 })
-	addDropdown(mainTab, "TargetMode", { Text = "Target priority (override)", Values = { "Nearest", "Boss first", "Lowest HP" }, Default = 2 })
-	addToggle(mainTab, "RequireSight", { Text = "Only through clear line of sight", Default = true })
-	addToggle(mainTab, "AutoSkills", { Text = "Auto class skills", Default = false })
-	addToggle(mainTab, "AutoUltimate", { Text = "Auto ultimate", Default = false })
-	addToggle(mainTab, "AutoTurret", { Text = "Auto turret", Default = false })
+	window:CreateCategory("Gameplay")
 
-	mainTab:AddSection("Survival")
-	addToggle(mainTab, "AvoidHazards", { Text = "Dodge boss attacks / acid", Default = false })
-	addToggle(mainTab, "Kite", { Text = "Kite the swarm (walk)", Default = false })
-	addSlider(mainTab, "KiteDistance", { Text = "Kite distance", Default = 22, Min = 8, Max = 60 })
-	addToggle(mainTab, "FlightOrbit", { Text = "Flight orbit farm", Default = false, Risky = true })
-	addToggle(mainTab, "FlightNoclip", { Text = "Noclip while flying", Default = false, Risky = true })
-	addSlider(mainTab, "FlightSpeed", { Text = "Flight speed", Default = 40, Min = 16, Max = 64 })
+	local combatTab = window:CreateTab("Combat")
+	combatTab:AddSection("Targeting")
+	addToggle(combatTab, "AutoFight", { Text = "Auto fight", Default = false })
+	addToggle(combatTab, "AimAssist", { Text = "Aim assist (manual fire)", Default = false })
+	addDropdown(combatTab, "AimMode", { Text = "Aim mode", Values = { "Game assist", "Override (risky)" }, Default = 1 })
+	addSlider(combatTab, "AssistCone", { Text = "Assist cone (deg)", Default = 180, Min = 20, Max = 180 })
+	addDropdown(combatTab, "TargetMode", { Text = "Target priority (override)", Values = { "Nearest", "Boss first", "Lowest HP" }, Default = 2 })
+	addToggle(combatTab, "RequireSight", { Text = "Only through clear line of sight", Default = true })
+	combatTab:AddSection("Skills")
+	addToggle(combatTab, "AutoSkills", { Text = "Auto class skills", Default = false })
+	addToggle(combatTab, "AutoUltimate", { Text = "Auto ultimate", Default = false })
+	addToggle(combatTab, "AutoTurret", { Text = "Auto turret", Default = false })
+	combatTab:AddSection("Fire rate")
+	addToggle(combatTab, "RapidFire", { Text = "Rapid fire", Default = false, Risky = true })
+	addSlider(combatTab, "RapidFireMult", { Text = "Fire rate multiplier", Default = 2, Min = 1, Max = 5, Increment = 0.5 })
 
-	mainTab:AddSection("Progress")
-	addToggle(mainTab, "AutoUpgrade", { Text = "Auto upgrade (gun, then health)", Default = false })
-	addToggle(mainTab, "AutoSkip", { Text = "Smart wave skip", Default = false })
-	addToggle(mainTab, "AutoChest", { Text = "Auto open chests (walks there)", Default = false })
-	addSlider(mainTab, "ChestReserve", { Text = "Keep cash reserve", Default = 0, Min = 0, Max = 2000 })
-	addToggle(mainTab, "AutoReplay", { Text = "Auto replay", Default = false })
-	addToggle(mainTab, "ReExecute", { Text = "Re-run hub after replay teleport", Default = true })
+	local survivalTab = window:CreateTab("Survival")
+	survivalTab:AddSection("Dodging")
+	addToggle(survivalTab, "AvoidHazards", { Text = "Dodge boss attacks / acid", Default = false })
+	addToggle(survivalTab, "Kite", { Text = "Kite the swarm (walk)", Default = false })
+	addSlider(survivalTab, "KiteDistance", { Text = "Kite distance", Default = 22, Min = 8, Max = 60 })
+	survivalTab:AddSection("Flight")
+	addToggle(survivalTab, "FlightOrbit", { Text = "Flight orbit farm", Default = false, Risky = true })
+	addToggle(survivalTab, "FlightNoclip", { Text = "Noclip while flying", Default = false, Risky = true })
+	addSlider(survivalTab, "FlightSpeed", { Text = "Flight speed", Default = 40, Min = 16, Max = 64 })
 
-	mainTab:AddSection("Status")
-	state.statusLabel = mainTab:AddLabel("Loading...")
+	local progressTab = window:CreateTab("Progress")
+	progressTab:AddSection("Upgrades")
+	addToggle(progressTab, "AutoUpgrade", { Text = "Auto upgrade (gun, then health)", Default = false })
+	addToggle(progressTab, "AutoSkip", { Text = "Smart wave skip", Default = false })
+	progressTab:AddSection("Loot")
+	addToggle(progressTab, "AutoChest", { Text = "Auto open chests (walks there)", Default = false })
+	addSlider(progressTab, "ChestReserve", { Text = "Keep cash reserve", Default = 0, Min = 0, Max = 2000 })
+	progressTab:AddSection("Runs")
+	addToggle(progressTab, "AutoReplay", { Text = "Auto replay", Default = false })
+	addToggle(progressTab, "ReExecute", { Text = "Re-run hub after replay teleport", Default = true })
 
-	local visualTab = window:CreateTab("Visuals")
-	visualTab:AddSection("ESP")
-	addToggle(visualTab, "MonkeyEsp", { Text = "Monkey ESP", Default = false })
-	addDropdown(visualTab, "EspColor", {
+	local statusTab = window:CreateTab("Status")
+	statusTab:AddSection("Run")
+	state.statusLabel = statusTab:AddLabel("Loading...")
+
+	window:CreateCategory("Visuals")
+
+	local espTab = window:CreateTab("ESP")
+	espTab:AddSection("Monkeys")
+	addToggle(espTab, "MonkeyEsp", { Text = "Monkey ESP", Default = false })
+	addDropdown(espTab, "EspColor", {
 		Text = "Monkey color",
 		Values = { "Gold", "Red", "Cyan", "Purple", "Green" },
 		Default = 1,
 		Map = ESP_COLORS,
 	})
-	addToggle(visualTab, "BossEsp", { Text = "Boss ESP", Default = true })
-	addToggle(visualTab, "Fullbright", { Text = "Fullbright", Default = false, Callback = Misc.setFullbright })
+	espTab:AddSection("Bosses")
+	addToggle(espTab, "BossEsp", { Text = "Boss ESP", Default = true })
 
-	local miscTab = window:CreateTab("Misc")
-	miscTab:AddSection("Player")
-	addToggle(miscTab, "AntiAfk", { Text = "Anti-AFK", Default = true })
-	addToggle(miscTab, "WalkSpeed", { Text = "Walk speed", Default = false, Risky = true })
-	addSlider(miscTab, "WalkSpeedValue", { Text = "Speed", Default = 22, Min = 16, Max = 40 })
-	addToggle(miscTab, "InfiniteJump", { Text = "Infinite jump", Default = false, Risky = true })
+	local worldTab = window:CreateTab("World")
+	worldTab:AddSection("Lighting")
+	addToggle(worldTab, "Fullbright", { Text = "Fullbright", Default = false, Callback = Misc.setFullbright })
+
+	window:CreateCategory("Player")
+
+	local moveTab = window:CreateTab("Movement")
+	moveTab:AddSection("Utility")
+	addToggle(moveTab, "AntiAfk", { Text = "Anti-AFK", Default = true })
+	moveTab:AddSection("Movement")
+	addToggle(moveTab, "WalkSpeed", { Text = "Walk speed", Default = false, Risky = true })
+	addSlider(moveTab, "WalkSpeedValue", { Text = "Speed", Default = 22, Min = 16, Max = 40 })
+	addToggle(moveTab, "InfiniteJump", { Text = "Infinite jump", Default = false, Risky = true })
+
+	window:CreateCategory("System")
 
 	local settingsTab = window:CreateTab("Settings")
 	settingsTab:AddSection("Menu")
@@ -1732,6 +1797,12 @@ function MonkeyHub.detach()
 	state.targetPoint, state.skillAimPoint = nil, nil
 	pcall(Flight.stop)
 	pcall(Misc.setFullbright, false)
+	if state.buffs and state.originalFireRate then
+		pcall(function()
+			state.buffs.fireRate = state.originalFireRate
+		end)
+		state.originalFireRate = false
+	end
 	maid:clean()
 	if Library then
 		pcall(Library.Unload, Library)
@@ -1748,6 +1819,7 @@ function MonkeyHub.init()
 	MonkeyHub.running = true
 	hookHazards()
 	hookAim()
+	hookRapidFire()
 	buildUi()
 	Esp.init()
 	Misc.init()

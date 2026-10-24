@@ -1177,6 +1177,311 @@ local function playIntro()
 end
 
 -- ---------------------------------------------------------------------------
+-- Card intro (default): trembling glyph clusters, the name wipes in under a shine, a rule draws itself.
+-- ---------------------------------------------------------------------------
+
+-- Plays the card intro and returns a finish() closure. Blocks until it ends or is skipped.
+---@return function
+local function playCardIntro()
+	local connections = {}
+	local tweens = {}
+	local skipped = false
+	local clock = 0
+	local cleaned = false
+
+	local gui = newScreenGui(INTRO_GUI_NAME, 1000)
+	local viewport = getViewport(gui)
+	local unit = math.clamp(viewport.X / 1100, 0.55, 1.2)
+
+	local sound = Instance.new("Sound")
+	sound.Name = "PremiumUI_IntroMusic"
+	sound.Volume = 0
+	sound.Looped = false
+
+	local function play(object, info, props)
+		local playing = tween(object, info, props)
+		table.insert(tweens, playing)
+		return playing
+	end
+
+	local function cleanup()
+		if cleaned then
+			return
+		end
+		cleaned = true
+
+		for _, connection in ipairs(connections) do
+			connection:Disconnect()
+		end
+		table.clear(connections)
+
+		for _, running in ipairs(tweens) do
+			pcall(function()
+				running:Cancel()
+			end)
+		end
+		table.clear(tweens)
+
+		pcall(function()
+			sound:Stop()
+		end)
+		sound:Destroy()
+		gui:Destroy()
+	end
+	table.insert(UI._cleanups, cleanup)
+
+	local window = UI._windows[1]
+	local titleText = window and window.Title or "Welcome"
+	local subtitleText = window and window.Subtitle or ""
+
+	-- Click anywhere (or Space) skips.
+	local card = create("TextButton", {
+		Name = "Card",
+		Size = UDim2.fromScale(1, 1),
+		AutoButtonColor = false,
+		Text = "",
+		BackgroundColor3 = COLORS.background,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = 1,
+		Parent = gui,
+	})
+	play(card, TweenInfo.new(0.35, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { BackgroundTransparency = 0 })
+	card.Activated:Connect(function()
+		skipped = true
+	end)
+
+	table.insert(
+		connections,
+		userInputService.InputBegan:Connect(function(input)
+			if input.KeyCode == Enum.KeyCode.Space and not userInputService:GetFocusedTextBox() then
+				skipped = true
+			end
+		end)
+	)
+
+	local flashBeat = create("Frame", {
+		Name = "FlashBeat",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = COLORS.white,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = 5,
+		Active = false,
+		Parent = gui,
+	})
+
+	local stage = create("Frame", {
+		Name = "Stage",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(900, 420),
+		BackgroundTransparency = 1,
+		ZIndex = 2,
+		Parent = gui,
+	})
+	create("UIScale", { Scale = unit, Parent = stage })
+
+	-- Four glyph clusters drift in from the middle, then tremble.
+	local glyphFont = Font.fromEnum(Enum.Font.Bangers)
+	local spots = { { -330, -120, -12, 64 }, { 320, -150, 9, 52 }, { 290, 130, -5, 40 }, { -300, 140, 7, 36 } }
+	local glyphs = {}
+	for index, spot in ipairs(spots) do
+		local glyph = newLabel({
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0.5, spot[1] * 0.6, 0.5, spot[2] * 0.6),
+			Size = UDim2.fromOffset(300, 90),
+			Text = "ゴゴゴ",
+			FontFace = glyphFont,
+			TextSize = spot[4],
+			TextColor3 = index % 2 == 1 and COLORS.accent or COLORS.cyan,
+			TextXAlignment = Enum.TextXAlignment.Center,
+			TextTransparency = 1,
+			Rotation = spot[3],
+			ZIndex = 3,
+			Parent = stage,
+		})
+		create("UIStroke", { Color = COLORS.black, Thickness = 2, Parent = glyph })
+		table.insert(glyphs, { object = glyph, base = spot })
+
+		task.delay(0.08 * index, function()
+			if cleaned then
+				return
+			end
+			play(glyph, TweenInfo.new(0.5, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { TextTransparency = 0.05 })
+			play(glyph, TweenInfo.new(0.7, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
+				Position = UDim2.new(0.5, spot[1], 0.5, spot[2]),
+			})
+		end)
+	end
+
+	-- Name: slam scale on the holder, beat pulse on the label, gold-to-cyan shine wipe.
+	local nameHolder = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 12),
+		Size = UDim2.fromOffset(900, 80),
+		BackgroundTransparency = 1,
+		ZIndex = 4,
+		Parent = stage,
+	})
+	local slamScale = create("UIScale", { Scale = 1.25, Parent = nameHolder })
+	local name = newLabel({
+		Size = UDim2.fromScale(1, 1),
+		Text = titleText,
+		FontFace = fontBold,
+		TextSize = 64,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextTransparency = 1,
+		ZIndex = 4,
+		Parent = nameHolder,
+	})
+	local pulseScale = create("UIScale", { Parent = name })
+	local shine = create("UIGradient", {
+		Color = ColorSequence.new({
+			ColorSequenceKeypoint.new(0, COLORS.text),
+			ColorSequenceKeypoint.new(0.42, COLORS.text),
+			ColorSequenceKeypoint.new(0.5, COLORS.cyan),
+			ColorSequenceKeypoint.new(0.58, COLORS.text),
+			ColorSequenceKeypoint.new(1, COLORS.text),
+		}),
+		Offset = Vector2.new(-1, 0),
+		Parent = name,
+	})
+
+	local rule = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 62),
+		Size = UDim2.fromOffset(0, 2),
+		BackgroundColor3 = COLORS.white,
+		BorderSizePixel = 0,
+		ZIndex = 4,
+		Parent = stage,
+	})
+	addAccentGradient(rule, 0)
+
+	local tag = newLabel({
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 86),
+		Size = UDim2.fromOffset(700, 24),
+		Text = subtitleText,
+		TextColor3 = COLORS.muted,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextTransparency = 1,
+		ZIndex = 4,
+		Parent = stage,
+	})
+
+	local hint = newLabel({
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.new(0.5, 0, 1, -24),
+		Size = UDim2.fromOffset(400, 20),
+		Text = "Click or press Space to skip",
+		TextColor3 = COLORS.muted,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextTransparency = 0.5,
+		ZIndex = 6,
+		Parent = gui,
+	})
+
+	-- Audio: silent fallback if there is no asset function or no file.
+	local assetId = resolveAudio()
+	if assetId then
+		pcall(function()
+			sound.SoundId = assetId
+			sound.Parent = soundService
+			sound:Play()
+		end)
+		play(sound, TweenInfo.new(0.5, Enum.EasingStyle.Linear), { Volume = 0.7 })
+	end
+
+	local level = 0
+	local tremble = 0
+	local random = Random.new()
+
+	table.insert(
+		connections,
+		runService.RenderStepped:Connect(function(dt)
+			clock += dt
+
+			-- Beat: real loudness when audio plays, a soft synthetic pulse otherwise.
+			local raw
+			if assetId and sound.IsPlaying then
+				raw = math.clamp(sound.PlaybackLoudness / 500, 0, 1)
+			else
+				local phase = (clock * 2) % 1
+				raw = (clock > 0.4 and phase < 0.15) and (1 - phase / 0.15) * 0.6 or 0
+			end
+			level = math.max(raw, level - dt * 3)
+
+			pulseScale.Scale = 1 + level * 0.05
+			flashBeat.BackgroundTransparency = 1 - level * 0.06
+			shine.Offset = Vector2.new(math.clamp(-1 + (clock - 0.5) * 1.6, -1, 1), 0)
+
+			-- Glyphs tremble at 30 fps once they have landed.
+			tremble += dt
+			if tremble >= 1 / 30 and clock > 0.8 then
+				tremble = 0
+				for _, glyph in ipairs(glyphs) do
+					glyph.object.Position =
+						UDim2.new(0.5, glyph.base[1] + random:NextInteger(-2, 2), 0.5, glyph.base[2] + random:NextInteger(-2, 2))
+				end
+			end
+		end)
+	)
+
+	local function at(time)
+		while clock < time and not skipped and not UI._destroyed do
+			task.wait()
+		end
+		return not skipped and not UI._destroyed
+	end
+
+	local function timeline()
+		if not at(0.25) then
+			return
+		end
+		play(name, TweenInfo.new(0.3, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { TextTransparency = 0 })
+		play(slamScale, TweenInfo.new(0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 })
+
+		if not at(0.45) then
+			return
+		end
+		play(rule, TweenInfo.new(0.7, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { Size = UDim2.fromOffset(520, 2) })
+
+		if not at(0.65) then
+			return
+		end
+		play(tag, TWEEN_UI, { TextTransparency = 0.2 })
+
+		at(3.2)
+	end
+
+	local ok, err = xpcall(timeline, onError)
+	if not ok then
+		warn("[PremiumUI] intro timeline failed: " .. tostring(err))
+	end
+
+	-- Dissolve the text while the music fades out over 1 s; the dark card stays up for the loading screen.
+	hint.Visible = false
+	local fade = TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+	play(name, fade, { TextTransparency = 1 })
+	play(tag, fade, { TextTransparency = 1 })
+	play(rule, fade, { BackgroundTransparency = 1 })
+	play(slamScale, fade, { Scale = 1.06 })
+	for _, glyph in ipairs(glyphs) do
+		play(glyph.object, fade, { TextTransparency = 1 })
+	end
+	play(sound, TweenInfo.new(1, Enum.EasingStyle.Linear), { Volume = 0 })
+
+	local fadeStart = os.clock()
+	while os.clock() - fadeStart < 1 and not UI._destroyed do
+		task.wait()
+	end
+
+	return cleanup
+end
+
+-- ---------------------------------------------------------------------------
 -- Loading screen
 -- ---------------------------------------------------------------------------
 
@@ -1471,6 +1776,8 @@ function UI:CreateWindow(config)
 	if config.Intro == false then
 		UI._skipIntro = true
 	end
+	-- "card" (default) or "hypercar".
+	UI._introStyle = config.IntroStyle or UI._introStyle
 
 	local self = setmetatable({
 		Title = tostring(config.Title or "Window"),
@@ -1550,20 +1857,27 @@ function UI:CreateWindow(config)
 		BackgroundTransparency = 1,
 		Parent = surface,
 	})
-	local sidebar = create("Frame", {
+	-- Scrolls so long tab lists with category headers still fit.
+	local sidebar = create("ScrollingFrame", {
 		Name = "Sidebar",
 		Size = UDim2.new(0, SIDEBAR_WIDTH, 1, 0),
 		BackgroundColor3 = COLORS.surface,
 		BorderSizePixel = 0,
+		ScrollBarThickness = 2,
+		ScrollBarImageColor3 = COLORS.accent,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
 		Parent = body,
 	})
 	create("Frame", {
-		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.fromScale(1, 0),
+		AnchorPoint = Vector2.new(0, 0),
+		Position = UDim2.fromOffset(SIDEBAR_WIDTH - 1, 0),
 		Size = UDim2.new(0, 1, 1, 0),
 		BackgroundColor3 = COLORS.raised,
 		BorderSizePixel = 0,
-		Parent = sidebar,
+		ZIndex = 2,
+		Parent = body,
 	})
 	create("UIPadding", {
 		PaddingTop = UDim.new(0, 14),
@@ -1696,6 +2010,27 @@ function Window:Notify(config)
 	pushNotification(config)
 end
 
+function Window:_nextSideOrder()
+	self._sideOrder = (self._sideOrder or 0) + 1
+	return self._sideOrder
+end
+
+-- Sidebar group header; tabs created after it sit under it.
+---@param name string
+function Window:CreateCategory(name)
+	return newLabel({
+		Name = "Category",
+		LayoutOrder = self:_nextSideOrder(),
+		Size = UDim2.new(1, 0, 0, #self.tabs == 0 and 22 or 30),
+		Text = string.upper(tostring(name)),
+		FontFace = fontBold,
+		TextSize = 12,
+		TextColor3 = COLORS.muted,
+		TextYAlignment = Enum.TextYAlignment.Bottom,
+		Parent = self.sidebar,
+	})
+end
+
 ---@param name string
 ---@return table
 function Window:CreateTab(name)
@@ -1703,7 +2038,7 @@ function Window:CreateTab(name)
 
 	local button = create("TextButton", {
 		Name = tab.Name,
-		LayoutOrder = #self.tabs + 1,
+		LayoutOrder = self:_nextSideOrder(),
 		Size = UDim2.new(1, 0, 0, 38),
 		AutoButtonColor = false,
 		Text = tab.Name,
@@ -2292,7 +2627,7 @@ local function run()
 		return
 	end
 
-	local ok, finishIntro = xpcall(playIntro, onError)
+	local ok, finishIntro = xpcall(UI._introStyle == "hypercar" and playIntro or playCardIntro, onError)
 	if not ok then
 		for _, cleanup in ipairs(UI._cleanups) do
 			pcall(cleanup)
