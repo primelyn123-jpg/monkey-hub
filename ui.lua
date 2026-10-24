@@ -64,6 +64,8 @@ local UI = {
 	_windows = {},
 	_cleanups = {},
 	_connections = {},
+	Flags = {},
+	_capturing = false,
 	_ready = false,
 	_destroyed = false,
 	_pendingNotifications = {},
@@ -111,6 +113,77 @@ local function disconnect(connection)
 
 	UI._connections[connection] = nil
 	connection:Disconnect()
+end
+
+-- Registers a component in UI.Flags. The flag defaults to "<Tab>_<Text>"; config.NoFlag skips registration.
+---@return table
+local function registerFlag(tab, config, kind, initial)
+	if config.NoFlag then
+		return { Type = kind, Value = initial }
+	end
+
+	local base = tostring(config.Flag or (tab.Name .. "_" .. tostring(config.Text or kind)))
+	local flag, suffix = base, 1
+	while UI.Flags[flag] do
+		suffix += 1
+		flag = base .. "_" .. suffix
+	end
+
+	local entry = { Flag = flag, Type = kind, Value = initial }
+	UI.Flags[flag] = entry
+	return entry
+end
+
+-- KeyCode, KeyCode name or nil ("None") -> KeyCode or nil.
+---@return EnumItem?
+local function resolveKey(value)
+	if typeof(value) == "EnumItem" then
+		return value
+	end
+	if type(value) == "string" and value ~= "None" then
+		local ok, key = pcall(function()
+			return Enum.KeyCode[value]
+		end)
+		if ok then
+			return key
+		end
+	end
+	return nil
+end
+
+-- File functions are executor-only: all six must exist or configs are unsupported.
+---@return table?
+local function resolveFileApi()
+	local api = {}
+	pcall(function()
+		api.makefolder, api.isfolder, api.writefile = makefolder, isfolder, writefile
+		api.readfile, api.listfiles, api.delfile = readfile, listfiles, delfile
+	end)
+
+	for _, name in ipairs({ "makefolder", "isfolder", "writefile", "readfile", "listfiles", "delfile" }) do
+		if type(api[name]) ~= "function" then
+			return nil
+		end
+	end
+	return api
+end
+
+-- Snapshot of every flag as JSON-safe values (KeyCodes become their .Name).
+---@return table
+local function encodeFlags()
+	local data = {}
+	for flag, entry in pairs(UI.Flags) do
+		local value = entry.Value
+		if typeof(value) == "EnumItem" then
+			value = value.Name
+		elseif value == nil and entry.Type == "Keybind" then
+			value = "None"
+		end
+		if value ~= nil then
+			data[flag] = value
+		end
+	end
+	return data
 end
 
 -- Builds an instance from a property table, parenting last.
@@ -354,6 +427,36 @@ local function resolveAudio()
 	end
 
 	return nil
+end
+
+-- Parents the Sound before anything else, waits off the timeline for it to load, then plays and fades it in over 0.5 s.
+-- If it never loads (bad asset) the intro simply stays silent.
+local function startMusic(sound, assetId, isCancelled, play)
+	local okSet = pcall(function()
+		sound.SoundId = assetId
+		sound.Parent = soundService
+	end)
+	if not okSet then
+		return
+	end
+
+	task.spawn(function()
+		local started = os.clock()
+		while not sound.IsLoaded and os.clock() - started < 3 do
+			if isCancelled() then
+				return
+			end
+			task.wait()
+		end
+		if isCancelled() or not sound.IsLoaded then
+			return
+		end
+
+		pcall(function()
+			sound:Play()
+		end)
+		play(sound, TweenInfo.new(0.5, Enum.EasingStyle.Linear), { Volume = 0.7 })
+	end)
 end
 
 -- Panel: a rounded CanvasGroup surface with a sibling stroke border (so the stroke is not clipped),
@@ -933,12 +1036,9 @@ local function playIntro()
 	-- Audio: silent fallback if there is no asset function or no file.
 	local assetId = resolveAudio()
 	if assetId then
-		pcall(function()
-			sound.SoundId = assetId
-			sound.Parent = soundService
-			sound:Play()
-		end)
-		play(sound, TweenInfo.new(0.5, Enum.EasingStyle.Linear), { Volume = 0.7 })
+		startMusic(sound, assetId, function()
+			return cleaned
+		end, play)
 	end
 
 	-- Frame loop state.
@@ -1386,12 +1486,9 @@ local function playCardIntro()
 	-- Audio: silent fallback if there is no asset function or no file.
 	local assetId = resolveAudio()
 	if assetId then
-		pcall(function()
-			sound.SoundId = assetId
-			sound.Parent = soundService
-			sound:Play()
-		end)
-		play(sound, TweenInfo.new(0.5, Enum.EasingStyle.Linear), { Volume = 0.7 })
+		startMusic(sound, assetId, function()
+			return cleaned
+		end, play)
 	end
 
 	local level = 0
@@ -1787,6 +1884,8 @@ function UI:CreateWindow(config)
 		_connections = {},
 		_opened = false,
 		_closed = false,
+		-- Open/close bind; RightShift unless the Settings keybind (or config.ToggleKey) says otherwise.
+		toggleKey = resolveKey(config.ToggleKey) or Enum.KeyCode.RightShift,
 	}, Window)
 
 	local panel = makePanel(gui, "Window", UDim2.fromOffset(width, height), COLORS.background, true)
@@ -1943,6 +2042,21 @@ function UI:CreateWindow(config)
 		end)
 	)
 
+	-- Open/close bind; ignored while typing or while a keybind is capturing.
+	table.insert(
+		self._connections,
+		connect(userInputService.InputBegan, function(input, processed)
+			if processed or UI._capturing or userInputService:GetFocusedTextBox() then
+				return
+			end
+			if input.KeyCode == self.toggleKey then
+				self:Toggle()
+			end
+		end)
+	)
+
+	self:_buildSettings()
+
 	table.insert(UI._windows, self)
 	if UI._ready then
 		self:_open()
@@ -1960,6 +2074,16 @@ function Window:_open()
 
 	self.panel.holder.Visible = true
 	panelIn(self.panel)
+
+	-- With no user tabs, the Settings tab is the landing page.
+	if not self.activeTab and self.settingsTab then
+		self:_select(self.settingsTab)
+	end
+
+	-- Autoload runs once the window is open.
+	if self._autoload then
+		task.delay(0.5, self._autoload)
+	end
 end
 
 -- Hides or shows the window with the same pop animation.
@@ -2021,7 +2145,7 @@ function Window:CreateCategory(name)
 	return newLabel({
 		Name = "Category",
 		LayoutOrder = self:_nextSideOrder(),
-		Size = UDim2.new(1, 0, 0, #self.tabs == 0 and 22 or 30),
+		Size = UDim2.new(1, 0, 0, self._hasUserTab and 30 or 22),
 		Text = string.upper(tostring(name)),
 		FontFace = fontBold,
 		TextSize = 12,
@@ -2033,12 +2157,13 @@ end
 
 ---@param name string
 ---@return table
-function Window:CreateTab(name)
+function Window:CreateTab(name, internal)
 	local tab = setmetatable({ Name = tostring(name), window = self, active = false, order = 0 }, Tab)
 
 	local button = create("TextButton", {
 		Name = tab.Name,
-		LayoutOrder = self:_nextSideOrder(),
+		-- The built-in Settings tab sorts after everything else.
+		LayoutOrder = internal and 1000000 or self:_nextSideOrder(),
 		Size = UDim2.new(1, 0, 0, 38),
 		AutoButtonColor = false,
 		Text = tab.Name,
@@ -2106,11 +2231,257 @@ function Window:CreateTab(name)
 	end)
 
 	table.insert(self.tabs, tab)
-	if #self.tabs == 1 then
+	if not internal and not self._hasUserTab then
+		self._hasUserTab = true
 		self:_select(tab)
 	end
 
 	return tab
+end
+
+-- Settings tab: always last in the sidebar. Toggle UI keybind plus the config manager.
+function Window:_buildSettings()
+	local tab = self:CreateTab("Settings", true)
+	self.settingsTab = tab
+
+	tab:AddSection("Interface")
+	tab:AddKeybind({
+		Text = "Toggle UI",
+		Default = self.toggleKey,
+		Callback = function(key)
+			-- "None" would lock the window shut, so it falls back to the default bind.
+			self.toggleKey = key or Enum.KeyCode.RightShift
+		end,
+	})
+
+	tab:AddSection("Configs")
+
+	local api = resolveFileApi()
+	local hubName = tostring(self.Title):gsub("[^%w_%-]", "")
+	if hubName == "" then
+		hubName = "PremiumUI"
+	end
+	local configDir = hubName .. "/configs"
+	local autoloadFile = hubName .. "/autoload.txt"
+
+	local function say(title, text)
+		self:Notify({ Title = title, Text = text, Duration = 3 })
+	end
+
+	local nameBox = tab:_addTextBox("Config name")
+	local picker = tab:AddDropdown({ Text = "Saved configs", Options = {}, NoFlag = true })
+
+	---@return string
+	local function cleanName(text)
+		return (tostring(text or ""):gsub("[^%w _%-]", ""):gsub("^%s+", ""):gsub("%s+$", ""))
+	end
+
+	-- Typed name wins for Save; the picked config wins for Load / Delete.
+	local function chosenName(preferTyped)
+		local typed = cleanName(nameBox.Get())
+		local picked = picker:Get()
+		if preferTyped then
+			return typed ~= "" and typed or picked
+		end
+		return picked or (typed ~= "" and typed or nil)
+	end
+
+	local function configPath(name)
+		return configDir .. "/" .. name .. ".json"
+	end
+
+	local function ensureFolders()
+		for _, folder in ipairs({ hubName, configDir }) do
+			if not api.isfolder(folder) then
+				api.makefolder(folder)
+			end
+		end
+	end
+
+	---@return string[]
+	local function listConfigs()
+		local names = {}
+		local ok, files = pcall(function()
+			ensureFolders()
+			return api.listfiles(configDir)
+		end)
+		if ok and type(files) == "table" then
+			for _, path in ipairs(files) do
+				local name = tostring(path):match("([^/\\]+)%.json$")
+				if name then
+					table.insert(names, name)
+				end
+			end
+		end
+		table.sort(names)
+		return names
+	end
+
+	-- Updates each element's visuals and fires its callback (every entry's Set does both).
+	local function applyData(data)
+		local applied = 0
+		for flag, value in pairs(data) do
+			local entry = UI.Flags[flag]
+			if entry and entry.Set then
+				if entry.Type == "Keybind" then
+					value = resolveKey(value)
+				end
+				if pcall(entry.Set, value) then
+					applied += 1
+				end
+			end
+		end
+		return applied
+	end
+
+	local autoloadToggle
+	local suppressAutoload = false
+
+	local function refresh(silent)
+		local names = listConfigs()
+		picker:SetOptions(names)
+		if not silent then
+			say("Configs", "Refreshed: " .. #names .. " saved")
+		end
+	end
+
+	local function save()
+		local name = chosenName(true)
+		if not name or name == "" then
+			return say("Save failed", "Type a config name first")
+		end
+
+		local ok, err = pcall(function()
+			ensureFolders()
+			api.writefile(configPath(name), game:GetService("HttpService"):JSONEncode(encodeFlags()))
+		end)
+		if not ok then
+			return say("Save failed", tostring(err))
+		end
+
+		say("Saved", name)
+		refresh(true)
+		picker:Set(name)
+	end
+
+	local function loadConfig(name, quiet)
+		if not name or name == "" then
+			return say("Load failed", "Pick or type a config")
+		end
+
+		local ok, result = pcall(function()
+			return game:GetService("HttpService"):JSONDecode(api.readfile(configPath(name)))
+		end)
+		if not ok or type(result) ~= "table" then
+			return say("Load failed", ok and "Config is not valid JSON" or tostring(result))
+		end
+
+		local applied = applyData(result)
+		if not quiet then
+			say("Loaded", name .. " (" .. applied .. " settings)")
+		end
+	end
+
+	local function delete()
+		local name = chosenName(false)
+		if not name or name == "" then
+			return say("Delete failed", "Pick or type a config")
+		end
+
+		local ok, err = pcall(function()
+			api.delfile(configPath(name))
+		end)
+		if not ok then
+			return say("Delete failed", tostring(err))
+		end
+
+		-- Autoload pointing at a deleted config is dropped.
+		pcall(function()
+			if api.readfile(autoloadFile) == name then
+				api.delfile(autoloadFile)
+				suppressAutoload = true
+				autoloadToggle:Set(false)
+				suppressAutoload = false
+			end
+		end)
+
+		say("Deleted", name)
+		refresh(true)
+	end
+
+	local rowButtons = tab:_addButtonRow({
+		{ Text = "Save", Callback = function() save() end },
+		{ Text = "Load", Callback = function() loadConfig(chosenName(false)) end },
+		{ Text = "Delete", Callback = function() delete() end },
+		{ Text = "Refresh", Callback = function() refresh(false) end },
+	})
+
+	autoloadToggle = tab:AddToggle({
+		Text = "Autoload this config",
+		Default = false,
+		NoFlag = true,
+		Callback = function(on)
+			if suppressAutoload then
+				return
+			end
+
+			if not api then
+				return
+			end
+
+			if on then
+				local name = chosenName(false)
+				if not name or name == "" then
+					say("Autoload failed", "Pick or save a config first")
+					suppressAutoload = true
+					autoloadToggle:Set(false)
+					suppressAutoload = false
+					return
+				end
+
+				local ok, err = pcall(function()
+					ensureFolders()
+					api.writefile(autoloadFile, name)
+				end)
+				say(ok and "Autoload on" or "Autoload failed", ok and name or tostring(err))
+			else
+				local ok, err = pcall(function()
+					api.delfile(autoloadFile)
+				end)
+				say(ok and "Autoload off" or "Autoload failed", ok and "Cleared" or tostring(err))
+			end
+		end,
+	})
+
+	if not api then
+		-- No file functions: disable the config UI and say so once.
+		tab:AddLabel("Configs not supported on this executor.")
+		for _, button in ipairs(rowButtons) do
+			button.Active = false
+			button.TextTransparency = 0.6
+		end
+		self._autoload = function()
+			say("Configs", "Configs not supported")
+		end
+		return
+	end
+
+	refresh(true)
+
+	-- Reflects an existing autoload marker, then loads it once the window is open.
+	self._autoload = function()
+		local ok, name = pcall(api.readfile, autoloadFile)
+		if not ok or type(name) ~= "string" or name == "" then
+			return
+		end
+
+		suppressAutoload = true
+		autoloadToggle:Set(true)
+		suppressAutoload = false
+		picker:Set(name)
+		loadConfig(name, true)
+		say("Autoload", name)
+	end
 end
 
 function Window:_select(selected)
@@ -2243,6 +2614,222 @@ function Tab:AddButton(config)
 	return button
 end
 
+-- Click, then press a key: Escape cancels, mouse buttons and game-processed input are ignored.
+-- Callback(key) fires when the bind changes; the optional Pressed() fires when the bound key is pressed.
+---@param config table {Text, Default, Callback, Pressed}
+function Tab:AddKeybind(config)
+	config = config or {}
+	local key = resolveKey(config.Default)
+	local listening = false
+	local captureConnection = nil
+
+	local row = self:_row("Keybind", 48)
+
+	newLabel({
+		Position = UDim2.fromOffset(16, 0),
+		Size = UDim2.new(1, -150, 1, 0),
+		Text = tostring(config.Text or "Keybind"),
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = row,
+	})
+
+	local button = create("TextButton", {
+		Name = "Key",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -12, 0.5, 0),
+		Size = UDim2.fromOffset(112, 30),
+		AutoButtonColor = false,
+		Text = "",
+		FontFace = fontMedium,
+		TextSize = TEXT_BODY,
+		TextColor3 = COLORS.text,
+		BackgroundColor3 = COLORS.raised,
+		BorderSizePixel = 0,
+		Parent = row,
+	})
+	addCorner(button, RADIUS_CONTROL)
+	local buttonStroke = addStroke(button, STROKE_IDLE)
+	bindHover(button, buttonStroke, STROKE_IDLE)
+	bindPress(button)
+
+	local keybind = {}
+	local entry = registerFlag(self, config, "Keybind", key)
+
+	local function render()
+		button.Text = listening and "..." or (key and key.Name or "None")
+	end
+
+	local function stopListening()
+		listening = false
+		UI._capturing = false
+		if captureConnection then
+			disconnect(captureConnection)
+			captureConnection = nil
+		end
+		render()
+	end
+
+	function keybind:Set(value)
+		key = resolveKey(value)
+		entry.Value = key
+		render()
+		safeCall(config.Callback, key)
+	end
+
+	function keybind:Get()
+		return key
+	end
+
+	entry.Set = function(value)
+		keybind:Set(value)
+	end
+
+	button.Activated:Connect(function()
+		if listening then
+			return stopListening()
+		end
+
+		listening = true
+		UI._capturing = true
+		render()
+
+		captureConnection = connect(userInputService.InputBegan, function(input, processed)
+			if input.UserInputType ~= Enum.UserInputType.Keyboard then
+				return
+			end
+
+			-- Roblox marks Escape as game-processed (it opens the menu), so cancel is checked first.
+			if input.KeyCode == Enum.KeyCode.Escape then
+				return stopListening()
+			end
+
+			if processed then
+				return
+			end
+
+			stopListening()
+			keybind:Set(input.KeyCode)
+		end)
+	end)
+
+	if type(config.Pressed) == "function" then
+		connect(userInputService.InputBegan, function(input, processed)
+			if processed or listening or not key or input.KeyCode ~= key then
+				return
+			end
+			safeCall(config.Pressed)
+		end)
+	end
+
+	render()
+	return keybind
+end
+
+-- Single-line input card (used by the config manager).
+---@return table
+function Tab:_addTextBox(placeholder)
+	local row = create("Frame", {
+		Name = "TextBox",
+		LayoutOrder = self:_nextOrder(),
+		Size = UDim2.new(1, 0, 0, 56),
+		BackgroundColor3 = COLORS.surface,
+		BorderSizePixel = 0,
+		Parent = self.page,
+	})
+	addCorner(row, RADIUS_CARD)
+	addStroke(row, STROKE_IDLE)
+
+	local box = create("TextBox", {
+		Position = UDim2.fromOffset(8, 8),
+		Size = UDim2.new(1, -16, 1, -16),
+		BackgroundColor3 = COLORS.raised,
+		BorderSizePixel = 0,
+		Text = "",
+		PlaceholderText = tostring(placeholder or ""),
+		PlaceholderColor3 = COLORS.muted,
+		TextColor3 = COLORS.text,
+		FontFace = fontMedium,
+		TextSize = TEXT_BODY,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		ClearTextOnFocus = false,
+		Parent = row,
+	})
+	addCorner(box, RADIUS_CONTROL)
+	create("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12), Parent = box })
+	local boxStroke = addStroke(box, STROKE_IDLE)
+	bindHover(box, boxStroke, STROKE_IDLE)
+
+	local object = {}
+
+	function object.Get()
+		return box.Text
+	end
+
+	function object.Set(text)
+		box.Text = tostring(text or "")
+	end
+
+	return object
+end
+
+-- A row of equal-width buttons inside one card; returns the buttons so callers can disable them.
+---@param items table[] {{Text, Callback}, ...}
+---@return TextButton[]
+function Tab:_addButtonRow(items)
+	local row = create("Frame", {
+		Name = "ButtonRow",
+		LayoutOrder = self:_nextOrder(),
+		Size = UDim2.new(1, 0, 0, 56),
+		BackgroundColor3 = COLORS.surface,
+		BorderSizePixel = 0,
+		Parent = self.page,
+	})
+	addCorner(row, RADIUS_CARD)
+	addStroke(row, STROKE_IDLE)
+	create("UIPadding", {
+		PaddingTop = UDim.new(0, 8),
+		PaddingBottom = UDim.new(0, 8),
+		PaddingLeft = UDim.new(0, 8),
+		PaddingRight = UDim.new(0, 8),
+		Parent = row,
+	})
+	create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 8),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Parent = row,
+	})
+
+	local count = #items
+	local buttons = {}
+	for index, item in ipairs(items) do
+		local button = create("TextButton", {
+			LayoutOrder = index,
+			Size = UDim2.new(1 / count, -math.ceil(8 * (count - 1) / count), 1, 0),
+			AutoButtonColor = false,
+			Text = tostring(item.Text),
+			FontFace = fontMedium,
+			TextSize = TEXT_BODY,
+			TextColor3 = COLORS.text,
+			BackgroundColor3 = COLORS.raised,
+			BorderSizePixel = 0,
+			Parent = row,
+		})
+		addCorner(button, RADIUS_CONTROL)
+		local stroke = addStroke(button, STROKE_IDLE)
+		bindHover(button, stroke, STROKE_IDLE)
+		bindPress(button)
+		button.Activated:Connect(function()
+			if button.Active then
+				safeCall(item.Callback)
+			end
+		end)
+		table.insert(buttons, button)
+	end
+
+	return buttons
+end
+
 ---@param config table {Text, Default, Callback}
 function Tab:AddToggle(config)
 	config = config or {}
@@ -2293,8 +2880,10 @@ function Tab:AddToggle(config)
 	addCorner(knob, RADIUS_PILL)
 
 	local toggle = {}
+	local entry = registerFlag(self, config, "Toggle", state)
 
 	local function render(animate)
+		entry.Value = state
 		local info = animate and TWEEN_UI or TweenInfo.new(0)
 		tween(knob, info, { Position = state and UDim2.new(1, -21, 0.5, 0) or UDim2.new(0, 3, 0.5, 0) })
 		tween(fill, info, { BackgroundTransparency = state and 0 or 1 })
@@ -2308,6 +2897,10 @@ function Tab:AddToggle(config)
 
 	function toggle:Get()
 		return state
+	end
+
+	entry.Set = function(value)
+		toggle:Set(value)
 	end
 
 	row.Activated:Connect(function()
@@ -2378,8 +2971,10 @@ function Tab:AddSlider(config)
 	addCorner(knob, RADIUS_PILL)
 
 	local slider = {}
+	local entry = registerFlag(self, config, "Slider", value)
 
 	local function render(animate)
+		entry.Value = value
 		local alpha = (value - min) / (max - min)
 		local info = animate and TWEEN_UI or TweenInfo.new(0)
 		tween(fill, info, { Size = UDim2.fromScale(alpha, 1) })
@@ -2407,6 +3002,10 @@ function Tab:AddSlider(config)
 
 	function slider:Get()
 		return value
+	end
+
+	entry.Set = function(newValue)
+		slider:Set(newValue)
 	end
 
 	-- Drag anywhere on the row; global move/end listeners exist only while dragging.
@@ -2524,8 +3123,10 @@ function Tab:AddDropdown(config)
 
 	local dropdown = {}
 	local optionButtons = {}
+	local entry = registerFlag(self, config, "Dropdown", selected)
 
 	local function refresh()
+		entry.Value = selected
 		valueLabel.Text = selected or "Select…"
 		for name, optionButton in pairs(optionButtons) do
 			tween(optionButton, TWEEN_UI, {
@@ -2540,38 +3141,67 @@ function Tab:AddDropdown(config)
 		tween(chevron, TWEEN_UI, { Rotation = open and 180 or 0 })
 	end
 
-	for index, option in ipairs(options) do
-		local name = tostring(option)
-		local optionButton = create("TextButton", {
-			LayoutOrder = index,
-			Size = UDim2.new(1, 0, 0, 34),
-			AutoButtonColor = false,
-			Text = name,
-			FontFace = fontMedium,
-			TextSize = TEXT_BODY,
-			TextColor3 = COLORS.text,
-			BackgroundColor3 = COLORS.raised,
-			BorderSizePixel = 0,
-			Parent = list,
-		})
-		addCorner(optionButton, RADIUS_CONTROL)
-		local optionStroke = addStroke(optionButton, 0.85)
-		bindHover(optionButton, optionStroke, 0.85)
-		bindPress(optionButton)
-		optionButtons[name] = optionButton
+	-- Builds (or rebuilds) the option buttons and resizes the card for the new list.
+	local function populate(newOptions)
+		for _, optionButton in pairs(optionButtons) do
+			optionButton:Destroy()
+		end
+		table.clear(optionButtons)
 
-		optionButton.Activated:Connect(function()
-			selected = name
-			refresh()
-			setOpen(false)
-			safeCall(config.Callback, name)
-		end)
+		listHeight = math.min(#newOptions, 5) * 38
+		openHeight = closedHeight + listHeight + 6
+		list.Size = UDim2.new(1, -12, 0, listHeight)
+		if isOpen then
+			tween(card, TWEEN_UI, { Size = UDim2.new(1, 0, 0, openHeight) })
+		end
+
+		for index, option in ipairs(newOptions) do
+			local name = tostring(option)
+			local optionButton = create("TextButton", {
+				LayoutOrder = index,
+				Size = UDim2.new(1, 0, 0, 34),
+				AutoButtonColor = false,
+				Text = name,
+				FontFace = fontMedium,
+				TextSize = TEXT_BODY,
+				TextColor3 = COLORS.text,
+				BackgroundColor3 = COLORS.raised,
+				BorderSizePixel = 0,
+				Parent = list,
+			})
+			addCorner(optionButton, RADIUS_CONTROL)
+			local optionStroke = addStroke(optionButton, 0.85)
+			bindHover(optionButton, optionStroke, 0.85)
+			bindPress(optionButton)
+			optionButtons[name] = optionButton
+
+			optionButton.Activated:Connect(function()
+				selected = name
+				refresh()
+				setOpen(false)
+				safeCall(config.Callback, name)
+			end)
+		end
 	end
+	populate(options)
 
 	head.Activated:Connect(function()
 		setOpen(not isOpen)
 	end)
 	refresh()
+
+	entry.Set = function(name)
+		dropdown:Set(name)
+	end
+
+	-- Replaces the option list (used by the config picker); keeps the selection if it still exists.
+	function dropdown:SetOptions(newOptions)
+		populate(newOptions)
+		if selected and not optionButtons[selected] then
+			selected = nil
+		end
+		refresh()
+	end
 
 	function dropdown:Set(name)
 		selected = name ~= nil and tostring(name) or nil
@@ -2613,17 +3243,31 @@ function UI:Destroy()
 end
 
 -- Intro -> loading -> windows open. Never errors: a failed stage is skipped.
+local function openWindows()
+	if UI._ready or UI._destroyed then
+		return
+	end
+
+	UI._ready = true
+	for _, window in ipairs(UI._windows) do
+		pcall(window._open, window)
+	end
+	for _, pending in ipairs(UI._pendingNotifications) do
+		pcall(pushNotification, pending)
+	end
+	table.clear(UI._pendingNotifications)
+end
+
 local function run()
+	-- The caller's CreateWindow may run a moment after load; wait for it so Intro/IntroStyle/Title are honoured.
+	local waited = os.clock()
+	while #UI._windows == 0 and os.clock() - waited < 1.5 and not UI._destroyed do
+		task.wait()
+	end
+
 	-- CreateWindow({Intro = false}) opens straight away.
 	if UI._skipIntro then
-		UI._ready = true
-		for _, window in ipairs(UI._windows) do
-			window:_open()
-		end
-		for _, pending in ipairs(UI._pendingNotifications) do
-			pushNotification(pending)
-		end
-		table.clear(UI._pendingNotifications)
+		openWindows()
 		return
 	end
 
@@ -2646,21 +3290,17 @@ local function run()
 	end
 
 	if okLoading and not UI._destroyed then
-		xpcall(runLoading, onError, loading)
+		local okRun = xpcall(runLoading, onError, loading)
+		if not okRun then
+			-- A failed loading screen must not leave its gui or connections behind.
+			for _, cleanup in ipairs(UI._cleanups) do
+				pcall(cleanup)
+			end
+			table.clear(UI._cleanups)
+		end
 	end
 
-	if UI._destroyed then
-		return
-	end
-
-	UI._ready = true
-	for _, window in ipairs(UI._windows) do
-		window:_open()
-	end
-	for _, pending in ipairs(UI._pendingNotifications) do
-		pushNotification(pending)
-	end
-	table.clear(UI._pendingNotifications)
+	openWindows()
 end
 
 -- Replace any previous instance, then start on the next frame so CreateWindow can run first.
@@ -2672,7 +3312,26 @@ pcall(function()
 end)
 destroyPrevious()
 task.defer(function()
-	xpcall(run, onError)
+	local ok = xpcall(run, onError)
+	if not ok then
+		-- Whatever failed, the UI must still open.
+		for _, cleanup in ipairs(UI._cleanups) do
+			pcall(cleanup)
+		end
+		table.clear(UI._cleanups)
+		openWindows()
+	end
+end)
+
+-- Watchdog: if the sequence is still stuck after 30 s, drop it and open the windows.
+task.delay(30, function()
+	if not UI._ready and not UI._destroyed then
+		for _, cleanup in ipairs(UI._cleanups) do
+			pcall(cleanup)
+		end
+		table.clear(UI._cleanups)
+		openWindows()
+	end
 end)
 
 return UI
@@ -2682,19 +3341,13 @@ return UI
 local UI = loadstring(readfile("ui.lua"))()
 
 local Window = UI:CreateWindow({
-	Title = "Premium UI",
+	Title = "Premium UI", -- also names the config folder: PremiumUI/configs/<name>.json
 	Subtitle = "Component showcase",
 })
 
 local Tab = Window:CreateTab("Demo")
 
-Tab:AddButton({
-	Text = "Send notification",
-	Callback = function()
-		Window:Notify({ Title = "Hello", Text = "Notifications slide in and stack.", Duration = 4 })
-	end,
-})
-
+-- Flagged toggle: the flag defaults to "Demo_Enable feature" and is saved/loaded with configs.
 Tab:AddToggle({
 	Text = "Enable feature",
 	Default = false,
@@ -2703,24 +3356,31 @@ Tab:AddToggle({
 	end,
 })
 
-Tab:AddSlider({
-	Text = "Intensity",
-	Min = 0,
-	Max = 100,
-	Default = 40,
-	Callback = function(value)
-		print("slider", value)
+-- Same toggle with an explicit flag (read it back with UI.Flags.Feature.Value).
+Tab:AddToggle({ Text = "Another feature", Flag = "Feature", Default = true })
+
+-- Keybind: Callback fires when the bind changes, Pressed fires when the key is pressed.
+Tab:AddKeybind({
+	Text = "Fire action",
+	Default = Enum.KeyCode.F,
+	Callback = function(key)
+		print("rebound to", key and key.Name or "None")
+	end,
+	Pressed = function()
+		Window:Notify({ Title = "Keybind", Text = "Action fired", Duration = 2 })
 	end,
 })
 
-Tab:AddDropdown({
-	Text = "Mode",
-	Options = { "Fast", "Balanced", "Careful" },
-	Callback = function(option)
-		print("dropdown", option)
+Tab:AddSlider({ Text = "Intensity", Min = 0, Max = 100, Default = 40 })
+Tab:AddDropdown({ Text = "Mode", Options = { "Fast", "Balanced", "Careful" }, Default = "Balanced" })
+Tab:AddButton({
+	Text = "Send notification",
+	Callback = function()
+		Window:Notify({ Title = "Hello", Text = "Notifications slide in and stack.", Duration = 4 })
 	end,
 })
 
-Window:CreateTab("About"):AddButton({ Text = "Nothing here yet" })
+-- RightShift opens/closes the window (rebind it under Settings > Toggle UI).
+-- The Settings tab is added automatically and is always last.
 
 ]]
