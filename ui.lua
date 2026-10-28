@@ -50,6 +50,11 @@ local WINDOW_WIDTH = 640
 local WINDOW_HEIGHT = 420
 local SIDEBAR_WIDTH = 170
 local HEADER_HEIGHT = 64
+local SIDEBAR_FOOTER = 56
+-- Far above any game interface: lower values let the game's own layers swallow clicks on the window.
+local DISPLAY_MAIN = 100000
+local DISPLAY_LOADING = 100900
+local DISPLAY_INTRO = 101000
 
 local fontBold = Font.new(FONT_FAMILY, Enum.FontWeight.Bold)
 local fontMedium = Font.new(FONT_FAMILY, Enum.FontWeight.Medium)
@@ -824,7 +829,7 @@ local function playIntro()
 	local clock = 0
 	local cleaned = false
 
-	local gui = newScreenGui(INTRO_GUI_NAME, 1000)
+	local gui = newScreenGui(INTRO_GUI_NAME, DISPLAY_INTRO)
 	local viewport = getViewport(gui)
 	local unit = math.clamp(viewport.X / 1100, 0.55, 1.4)
 
@@ -1289,7 +1294,7 @@ local function playCardIntro()
 	local clock = 0
 	local cleaned = false
 
-	local gui = newScreenGui(INTRO_GUI_NAME, 1000)
+	local gui = newScreenGui(INTRO_GUI_NAME, DISPLAY_INTRO)
 	local viewport = getViewport(gui)
 	local unit = math.clamp(viewport.X / 1100, 0.55, 1.2)
 
@@ -1584,7 +1589,7 @@ end
 
 ---@return table
 local function buildLoading()
-	local gui = newScreenGui(LOADING_GUI_NAME, 900)
+	local gui = newScreenGui(LOADING_GUI_NAME, DISPLAY_LOADING)
 
 	local backdrop = create("Frame", {
 		Size = UDim2.fromScale(1, 1),
@@ -1747,7 +1752,7 @@ local function ensureMainGui()
 		return mainGui
 	end
 
-	mainGui = newScreenGui(GUI_NAME, 100)
+	mainGui = newScreenGui(GUI_NAME, DISPLAY_MAIN)
 	notificationHolder = create("Frame", {
 		Name = "Notifications",
 		AnchorPoint = Vector2.new(1, 1),
@@ -1959,7 +1964,7 @@ function UI:CreateWindow(config)
 	-- Scrolls so long tab lists with category headers still fit.
 	local sidebar = create("ScrollingFrame", {
 		Name = "Sidebar",
-		Size = UDim2.new(0, SIDEBAR_WIDTH, 1, 0),
+		Size = UDim2.new(0, SIDEBAR_WIDTH, 1, -SIDEBAR_FOOTER),
 		BackgroundColor3 = COLORS.surface,
 		BorderSizePixel = 0,
 		ScrollBarThickness = 2,
@@ -1985,6 +1990,29 @@ function UI:CreateWindow(config)
 		Parent = sidebar,
 	})
 	create("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = sidebar })
+
+	-- Fixed footer: the Settings tab lives here so it is always reachable, however long the tab list is.
+	local footer = create("Frame", {
+		Name = "SidebarFooter",
+		Position = UDim2.new(0, 0, 1, -SIDEBAR_FOOTER),
+		Size = UDim2.new(0, SIDEBAR_WIDTH, 0, SIDEBAR_FOOTER),
+		BackgroundColor3 = COLORS.surface,
+		BorderSizePixel = 0,
+		Parent = body,
+	})
+	create("Frame", {
+		Size = UDim2.new(1, 0, 0, 1),
+		BackgroundColor3 = COLORS.raised,
+		BorderSizePixel = 0,
+		Parent = footer,
+	})
+	create("UIPadding", {
+		PaddingTop = UDim.new(0, 9),
+		PaddingLeft = UDim.new(0, 12),
+		PaddingRight = UDim.new(0, 13),
+		Parent = footer,
+	})
+	self.sidebarFooter = footer
 
 	local content = create("Frame", {
 		Name = "Content",
@@ -2041,12 +2069,11 @@ function UI:CreateWindow(config)
 			panel.gradient.Rotation = (panel.gradient.Rotation + dt * 40) % 360
 		end)
 	)
-
-	-- Open/close bind; ignored while typing or while a keybind is capturing.
+	-- Open/close bind. Works even when the game also binds the key (it arrives game-processed); ignored while typing or capturing.
 	table.insert(
 		self._connections,
-		connect(userInputService.InputBegan, function(input, processed)
-			if processed or UI._capturing or userInputService:GetFocusedTextBox() then
+		connect(userInputService.InputBegan, function(input)
+			if UI._capturing or userInputService:GetFocusedTextBox() then
 				return
 			end
 			if input.KeyCode == self.toggleKey then
@@ -2173,7 +2200,7 @@ function Window:CreateTab(name, internal)
 		TextXAlignment = Enum.TextXAlignment.Left,
 		BackgroundColor3 = COLORS.surface,
 		BorderSizePixel = 0,
-		Parent = self.sidebar,
+		Parent = internal and self.sidebarFooter or self.sidebar,
 	})
 	addCorner(button, RADIUS_CONTROL)
 	create("UIPadding", { PaddingLeft = UDim.new(0, 18), Parent = button })
@@ -2614,7 +2641,8 @@ function Tab:AddButton(config)
 	return button
 end
 
--- Click, then press a key: Escape cancels, mouse buttons and game-processed input are ignored.
+-- Click, then press a key: Escape cancels, mouse buttons are ignored, and keys are ignored while a text box has focus.
+-- Game-processed keys are accepted on purpose: games often bind RightShift/Control themselves.
 -- Callback(key) fires when the bind changes; the optional Pressed() fires when the bound key is pressed.
 ---@param config table {Text, Default, Callback, Pressed}
 function Tab:AddKeybind(config)
@@ -2693,7 +2721,7 @@ function Tab:AddKeybind(config)
 		UI._capturing = true
 		render()
 
-		captureConnection = connect(userInputService.InputBegan, function(input, processed)
+		captureConnection = connect(userInputService.InputBegan, function(input)
 			if input.UserInputType ~= Enum.UserInputType.Keyboard then
 				return
 			end
@@ -2703,7 +2731,7 @@ function Tab:AddKeybind(config)
 				return stopListening()
 			end
 
-			if processed then
+			if userInputService:GetFocusedTextBox() then
 				return
 			end
 
@@ -2713,8 +2741,8 @@ function Tab:AddKeybind(config)
 	end)
 
 	if type(config.Pressed) == "function" then
-		connect(userInputService.InputBegan, function(input, processed)
-			if processed or listening or not key or input.KeyCode ~= key then
+		connect(userInputService.InputBegan, function(input)
+			if userInputService:GetFocusedTextBox() or listening or not key or input.KeyCode ~= key then
 				return
 			end
 			safeCall(config.Pressed)
